@@ -21,6 +21,8 @@
 
 /* Includes from sys/ */
 #include<sys/stat.h>
+#include<sys/types.h>
+#include<sys/wait.h>
 
 /* Local includes */
 #include"std_djc.h"
@@ -29,7 +31,7 @@
 #include"perf_event_open.c"
 
 /* Defaults */
-#define DEFAULT_BUFFER_SIZE 512 * 1024; /* 512kb */
+#define DEFAULT_BUFFER_SIZE 512 * 1024 /* 512kb */
 #define DEFAULT_FREQ 1000 /* 1000hz */
 #define DEFAULT_FILENAME "events.count" /* Default filename */
 
@@ -73,7 +75,7 @@ int main(int argc, char * argv[])
     int mmap_region = DEFAULT_BUFFER_SIZE;
     char * default_filename = DEFAULT_FILENAME;
     char * out = default_filename;
-	bool exit_error = false;
+    bool exit_error = false;
 
     /* Argument parsing */
     char opt;
@@ -83,8 +85,8 @@ int main(int argc, char * argv[])
     int chk;
     while((opt = getopt(argc, argv, "+hre:u:f:p:o:m:k:")) != -1)
     {
-		switch(opt)
-		{
+        switch(opt)
+        {
             /* Set realtime mode (UNIMPLEMENTED) */
             case 'r':
                 err_msg("-r is unimplemented in this release.\n\n");
@@ -179,7 +181,7 @@ int main(int argc, char * argv[])
                 if(arg > 128 * 1024)
                     err_msg("mmap buffer specified is larger than 128mb.  That seems large, don't you think?  I refuse to be party to this.\n\n");
                 mmap_region = arg * 1024;
-				optarg = NULL;
+                optarg = NULL;
                 break;
     
             /* Print usage */
@@ -187,10 +189,10 @@ int main(int argc, char * argv[])
             default:
                 print_usage();
                 return 0;
-		}
+        }
     }
 
-	/* Option validity checks */
+    /* Option validity checks */
     if(!OPT_E)
         err_msg("No event code specified!\n\n");
     if(!OPT_U)
@@ -221,7 +223,6 @@ int main(int argc, char * argv[])
         }
         else /* We are the parent */
         {
-            /* Insert new pid into pidlist */
             pid = ret;
             OPT_P = true;
         }
@@ -231,22 +232,44 @@ int main(int argc, char * argv[])
     if(!OPT_P)
         err_msg("No process specified!\n\n");
 
+    /* Configure perf_event_attr */
+    struct perf_event_attr e;
+    memset(&e, 0, sizeof(struct perf_event_attr));
+    e.type = PERF_TYPE_RAW;
+    e.size = sizeof(struct perf_event_attr);
+    e.config = event | umask << 8;
+    e.freq = 1;
+    e.sample_freq = freq;
+    e.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_READ;
+    e.inherit = 1;
+    e.pinned = 1;
+    e.exclude_user = 0;
+    e.exclude_kernel = 0;
+    e.exclude_hv = 1;
+    e.exclude_idle = 1;
 
-	/* Cleanup and exit cleanly */
-	goto cleanup;
+    /* Initialize performance events */
+    int pe_fd;
+    pe_fd = perf_event_open(&e, pid, -1, -1, 0);
+    err_chk(pe_fd == -1);
+
+    /* Cleanup and exit cleanly */
+    goto cleanup;
 
 /* Error handler */
 err:
-	perror("event_count:");
-	exit_error = true;
+    perror("event_count");
+    exit_error = true;
 
 /* Cleanup anything that needs to be cleaned up */
 cleanup:
+    if(pe_results)
+        free(pe_results);
 
 /* Exit */
-	if(exit_error)
-		exit(EXIT_FAILURE);
-	exit(EXIT_SUCCESS);
+    if(exit_error)
+        exit(EXIT_FAILURE);
+    exit(EXIT_SUCCESS);
 }
 
 /* Error message handler */
