@@ -18,11 +18,13 @@
 #include<errno.h>
 #include<string.h>
 #include<libgen.h>
+#include<fcntl.h>
 
 /* Includes from sys/ */
 #include<sys/stat.h>
 #include<sys/types.h>
 #include<sys/wait.h>
+#include<sys/mman.h>
 
 /* Local includes */
 #include"std_djc.h"
@@ -32,8 +34,13 @@
 
 /* Defaults */
 #define DEFAULT_BUFFER_SIZE 512 * 1024 /* 512kb */
-#define DEFAULT_FREQ 1000 /* 1000hz */
+#define DEFAULT_FREQ 10000 /* 10000hz */
 #define DEFAULT_FILENAME "events.count" /* Default filename */
+#define DEFAULT_INTERVAL 120 * 1000 /* 120ms */
+
+/* Define rmb() */
+/* #define rmb()   __asm__ __volatile__("":::"memory") */ /* Should be a read barrier only */
+#define rmb() __sync_synchronize() /* rmb implemented as a full memory barrier, but using gcc intrinstics */
 
 /* Options */
 bool OPT_H = false;
@@ -44,6 +51,7 @@ bool OPT_F = false;
 bool OPT_R = false;
 bool OPT_O = false;
 bool OPT_MK = false;
+bool OPT_I = false;
 
 /* Functions */
 void print_usage();
@@ -58,11 +66,12 @@ void print_usage()
     fprintf(stderr, "\t-e <hex> Event number (in hex)\n");
     fprintf(stderr, "\t-u <hex> Umask value (in hex)\n");
     fprintf(stderr, "\t-p <pid> Attach to pid <pid>\n");
-    fprintf(stderr, "\t-f <hz> Frequency in times per second (default: 1000)\n");
+    fprintf(stderr, "\t-f <hz> Frequency in samples per second (default: 10000)\n");
 /*  fprintf(stderr, "\t-r Run using highest realtime priority\n"); */ /* Unimplemented */
     fprintf(stderr, "\t-o <file> Output file (default: events.count)\n");
     fprintf(stderr, "\t-m <mb> mmap() buffer in megabytes\n");
     fprintf(stderr, "\t-k <kb> mmap() buffer in kilobytes (default: 512)\n");
+    fprintf(stderr, "\t-i <ms> Interval between data collection, in milliseconds (default 120ms)\n");
 }
 
 /* Main program logic */
@@ -75,6 +84,7 @@ int main(int argc, char * argv[])
     int mmap_region = DEFAULT_BUFFER_SIZE;
     char * default_filename = DEFAULT_FILENAME;
     char * out = default_filename;
+    int interval_ms = DEFAULT_INTERVAL;
     bool exit_error = false;
 
     /* Argument parsing */
@@ -83,7 +93,7 @@ int main(int argc, char * argv[])
     long arg;
     struct stat chkstat;
     int chk;
-    while((opt = getopt(argc, argv, "+hre:u:f:p:o:m:k:")) != -1)
+    while((opt = getopt(argc, argv, "+hre:u:f:p:o:m:k:i:")) != -1)
     {
         switch(opt)
         {
@@ -142,8 +152,10 @@ int main(int argc, char * argv[])
                     err_msg("Unable to parse -f argument correctly, should be a frequency in whole numbers of hz\n\n");
                 if(arg < 1)
                     err_msg("Unable to parse -f argument correctly, frequency must be greater than 1\n\n");
-                if(arg > 100000)
-                    err_msg("Unable to parse -f argument correctly, frequencies above 100000hz are unsupported\n\n");
+                if(arg < 2000)
+                    fprintf(stderr, "Warning: frequencies below 2000hz miss samples often in our testing.\n\n");
+                if(arg > 1000000000)
+                    err_msg("Unable to parse -f argument correctly, frequencies above 1ghz are unsupported\n\n");
                 freq = arg;
                 optarg = NULL;
                 break;
@@ -180,7 +192,28 @@ int main(int argc, char * argv[])
                     arg *= 1024;
                 if(arg > 128 * 1024)
                     err_msg("mmap buffer specified is larger than 128mb.  That seems large, don't you think?  I refuse to be party to this.\n\n");
-                mmap_region = arg * 1024;
+                if(arg < 8)
+                    err_msg("mmap buffer must be at least 8kb.\n\n");
+                arg *= 1024;
+                mmap_region = getpagesize();
+                while(mmap_region < arg)
+                    mmap_region <<= 1;
+                if(mmap_region != arg)
+                    err_msg("mmap buffer must be specified as a power of two.\n\n");
+                optarg = NULL;
+                break;
+
+            /* Specify interval between data collection, in milliseconds */
+            case 'i':
+                if(OPT_I)
+                    fprintf(stderr, "-i already specified, ignoring previous value...\n\n");
+                OPT_I = true;
+                arg = strtol(optarg, &strerr, 10);
+                if(strerr[0] != 0)
+                    err_msg("Unable to parse -i argument correctly, should be number of milliseconds\n\n");
+                if(arg < 0)
+                    err_msg("Unable to parse -i argument, must be a positive number\n\n");
+                interval_ms = arg * 1000;
                 optarg = NULL;
                 break;
     
@@ -220,6 +253,7 @@ int main(int argc, char * argv[])
             arglist[argc - optind] = NULL;
             chk = execvp(argv[optind], arglist); /* Never returns */
             err_chk(chk == -1);
+            sleep(1); //XXX: Remove me?
         }
         else /* We are the parent */
         {
@@ -241,17 +275,66 @@ int main(int argc, char * argv[])
     e.freq = 1;
     e.sample_freq = freq;
     e.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_READ;
-    e.inherit = 1;
     e.pinned = 1;
     e.exclude_user = 0;
     e.exclude_kernel = 0;
     e.exclude_hv = 1;
-    e.exclude_idle = 1;
 
     /* Initialize performance events */
     int pe_fd;
     pe_fd = perf_event_open(&e, pid, -1, -1, 0);
     err_chk(pe_fd == -1);
+
+    /* mmap buffer */
+    void * pem = NULL;
+    void * events = NULL;
+    int tail = 0;
+    struct perf_event_mmap_page * hdr = NULL;
+    pem = mmap(NULL, mmap_region + getpagesize(), PROT_READ, MAP_SHARED, pe_fd, 0); /* Failing point */
+    err_chk(pem == MAP_FAILED);
+
+    hdr = pem;
+    events = (char *) pem + getpagesize();
+
+    /* Open output file */
+    int outfd = 0;
+    void * outbuf = NULL;
+    FILE * output = NULL;
+    outfd = open(out, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+    err_chk(outfd == -1);
+    outbuf = calloc(1, mmap_region);
+    err_chk(outbuf == NULL);
+    output = fdopen(outfd, "w");
+    err_chk(output == NULL);
+
+    while(1) /* Main Loop */
+    {
+        usleep(interval_ms);
+
+        int head = hdr->data_head;
+        rmb();
+
+        if(head == tail)
+            continue;
+
+        if(head - tail > mmap_region)
+            fprintf(stderr, "Missed samples!  Enlarge mmap region!\n");
+
+        /* Copy into buffer */
+        if(head % mmap_region < tail % mmap_region)
+        {
+            memcpy(outbuf, (char *) events + (tail % mmap_region), mmap_region - (tail % mmap_region));
+            memcpy((char *) outbuf + (mmap_region - (tail % mmap_region)), events, head % mmap_region);
+        }
+        else
+            memcpy(outbuf, (char *) events + (tail % mmap_region), head - tail);
+
+        chk = fwrite(outbuf, 1, head - tail, output);
+        err_chk(chk != head - tail);
+
+        tail += head - tail;
+
+    }
 
     /* Cleanup and exit cleanly */
     goto cleanup;
@@ -263,8 +346,16 @@ err:
 
 /* Cleanup anything that needs to be cleaned up */
 cleanup:
-    if(pe_results)
-        free(pe_results);
+    if(pem && pem != MAP_FAILED)
+        munmap(pem, mmap_region + getpagesize());
+    if(pe_fd && pe_fd != -1)
+        close(pe_fd);
+    if(output != NULL)
+        fclose(output);
+    if(outfd && outfd != -1 && output == NULL)
+        close(outfd);
+    if(outbuf)
+        free(outbuf);
 
 /* Exit */
     if(exit_error)
