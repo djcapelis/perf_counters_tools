@@ -1,0 +1,24 @@
+perf_counters_tools is a repository of code I created out of frustration to understand and experiment with Linux's performance counter interface while working on a project where that made sense.  I had the hex event code and umask specified backwards using the raw events interface for the perf record tool.  I had blithely assumed that the order from the listing in the Intel Architecture Manuals was the way to go, when the order they're expected is the same order they are loaded into the register which configures the performance counters.  Not recognizing my folly, the following code came out of my frustration to determine what was going on in there and figure out what was wrong.  By the time I realized the error that inspired me to create this code, it was too late.  I kept writing.
+
+One day I may add another tool or two.  But that day is not today.
+
+event_count is a tool that takes an event code and umask for a performance counter and tracks the values for that performance event against a specified process.  In short, it contains fewer features than perf record from the perf suite of tools while providing seemingly no other advantage.  Except to me, since I know the story behind every line of code and the fight involved in creating it.
+
+event_count in its own words:
+$ ./event_count -h
+Usage: event_count [options] [command]
+    -h Print usage
+    -e <hex> Event number (in hex)
+    -u <hex> Umask value (in hex)
+    -p <pid> Attach to pid <pid>
+    -f <hz> Frequency in samples per second (default: 10000)
+    -o <file> Output file (default: events.count)
+    -m <mb> mmap() buffer in megabytes
+    -k <kb> mmap() buffer in kilobytes (default: 512)
+    -i <ms> Interval between data collection, in milliseconds (default 120ms)
+
+Limitations:
+* Linux only
+* Does not bother to check the version number of the mmap layout and may break in a future kernel version (tested against 3.14)
+
+Bugs: Likely many.
